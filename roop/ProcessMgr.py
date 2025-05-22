@@ -6,7 +6,7 @@ import psutil
 from roop.ProcessOptions import ProcessOptions
 
 from roop.face_util import get_first_face, get_all_faces, rotate_anticlockwise, rotate_clockwise, clamp_cut_values
-from roop.utilities import compute_cosine_distance, get_device, str_to_class, shuffle_array
+from roop.utilities import compute_cosine_distance, get_device, str_to_class
 import roop.vr_util as vr
 
 from typing import Any, List, Callable
@@ -18,6 +18,7 @@ from tqdm import tqdm
 from roop.ffmpeg_writer import FFMPEG_VideoWriter
 from roop.StreamWriter import StreamWriter
 import roop.globals
+import gc
 
 
 
@@ -117,11 +118,6 @@ class ProcessMgr():
         roop.globals.g_desired_face_analysis=["landmark_3d_68", "landmark_2d_106","detection","recognition"]
         if options.swap_mode == "all_female" or options.swap_mode == "all_male":
             roop.globals.g_desired_face_analysis.append("genderage")
-        elif options.swap_mode == "all_random":
-            # don't modify original list
-            self.input_face_datas = input_faces.copy()
-            shuffle_array(self.input_face_datas)
-
 
         for p in self.processors:
             newp = next((x for x in options.processors.keys() if x == p.processorname), None)
@@ -138,14 +134,6 @@ class ProcessMgr():
                 p = str_to_class(module, classname)
             if p is not None:
                 extoption.update({"devicename": devicename})
-                if p.type == "swap":
-                    if self.options.swap_modelname == "InSwapper 128":
-                        extoption.update({"modelname": "inswapper_128.onnx"})
-                    elif self.options.swap_modelname == "ReSwapper 128":
-                        extoption.update({"modelname": "reswapper_128.onnx"})
-                    elif self.options.swap_modelname == "ReSwapper 256":
-                        extoption.update({"modelname": "reswapper_256.onnx"})
-
                 p.Initialize(extoption)
                 newprocessors.append(p)
             else:
@@ -193,7 +181,7 @@ class ProcessMgr():
 
 
     def process_frames(self, source_files: List[str], target_files: List[str], current_files, update: Callable[[], None]) -> None:
-        for f in current_files:
+        for idx, f in enumerate(current_files):
             if not roop.globals.processing:
                 return
             
@@ -209,9 +197,14 @@ class ProcessMgr():
                 if resimg is not None:
                     i = source_files.index(f)
                     # Also let numpy write the file to support utf-8/16 filenames
-                    cv2.imencode(f'.{roop.globals.CFG.output_image_format}',resimg)[1].tofile(target_files[i])
+                    cv2.imencode(f'.{roop.globals.CFG.output_image_format}', resimg)[1].tofile(target_files[i])
+            
             if update:
                 update()
+            
+            # Aggressively collect garbage every 10 frames
+            if idx % 10 == 0:
+                gc.collect()
 
 
 
@@ -237,6 +230,7 @@ class ProcessMgr():
 
 
     def process_videoframes(self, threadindex, progress) -> None:
+        frame_counter = 0
         while True:
             frame = self.frames_queue[threadindex].get()
             if frame is None:
@@ -253,6 +247,10 @@ class ProcessMgr():
                 self.processed_queue[threadindex].put((True, resimg))
                 del frame
                 progress()
+            
+            frame_counter += 1
+            if frame_counter % 10 == 0:
+                gc.collect()
 
 
     def write_frames_thread(self):
@@ -430,7 +428,7 @@ class ProcessMgr():
                     num_faces_found += 1
                     temp_frame = self.process_face(self.options.selected_index, face, temp_frame)
 
-            elif self.options.swap_mode == "all_input" or self.options.swap_mode == "all_random":
+            elif self.options.swap_mode == "all_input":
                 for i,face in enumerate(faces):
                     num_faces_found += 1
                     if i < len(self.input_face_datas):
@@ -604,8 +602,8 @@ class ProcessMgr():
             Kind of subsampling the cutout and aligned face image and faceswapping slices of it up to
             the desired output resolution. This works around the current resolution limitations without using enhancers.
         """
-        model_output_size = self.options.swap_output_size
-        subsample_size = max(self.options.subsample_size, model_output_size)
+        model_output_size = 128
+        subsample_size = self.options.subsample_size
         subsample_total = subsample_size // model_output_size
         aligned_img, M = align_crop(frame, target_face.kps, subsample_size)
 

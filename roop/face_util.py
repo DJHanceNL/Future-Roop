@@ -10,31 +10,34 @@ import numpy as np
 from skimage import transform as trans
 from roop.capturer import get_video_frame
 from roop.utilities import resolve_relative_path, conditional_thread_semaphore
+import hashlib
 
+# Globals for aggressive face cache
 FACE_ANALYSER = None
-#THREAD_LOCK_ANALYSER = threading.Lock()
-#THREAD_LOCK_SWAPPER = threading.Lock()
 FACE_SWAPPER = None
 
+_last_gray_frame = None
+_last_faces = None
+_cache_reuse_count = 0
+_CACHE_REUSE_MAX = 5  # Number of frames to reuse face detection if similar
 
 def get_face_analyser() -> Any:
     global FACE_ANALYSER
-
     with conditional_thread_semaphore():
         if FACE_ANALYSER is None or roop.globals.g_current_face_analysis != roop.globals.g_desired_face_analysis:
             model_path = resolve_relative_path('..')
-            # removed genderage
             allowed_modules = roop.globals.g_desired_face_analysis
             roop.globals.g_current_face_analysis = roop.globals.g_desired_face_analysis
             if roop.globals.CFG.force_cpu:
                 print("Forcing CPU for Face Analysis")
                 FACE_ANALYSER = insightface.app.FaceAnalysis(
                     name="buffalo_l",
-                    root=model_path, providers=["CPUExecutionProvider"],allowed_modules=allowed_modules
+                    root=model_path, providers=["CPUExecutionProvider"], allowed_modules=allowed_modules
                 )
             else:
+                # CUDA provider preferred if available
                 FACE_ANALYSER = insightface.app.FaceAnalysis(
-                    name="buffalo_l", root=model_path, providers=roop.globals.execution_providers,allowed_modules=allowed_modules
+                    name="buffalo_l", root=model_path, providers=roop.globals.execution_providers, allowed_modules=allowed_modules
                 )
             FACE_ANALYSER.prepare(
                 ctx_id=0,
@@ -42,23 +45,39 @@ def get_face_analyser() -> Any:
             )
     return FACE_ANALYSER
 
-
 def get_first_face(frame: Frame) -> Any:
     try:
-        faces = get_face_analyser().get(frame)
-        return min(faces, key=lambda x: x.bbox[0])
-    #   return sorted(faces, reverse=True, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))[0]
-    except:
+        faces = get_all_faces(frame)
+        if faces:
+            return min(faces, key=lambda x: x.bbox[0])
         return None
-
+    except Exception:
+        return None
 
 def get_all_faces(frame: Frame) -> Any:
+    global _last_gray_frame, _last_faces, _cache_reuse_count, _CACHE_REUSE_MAX
     try:
-        faces = get_face_analyser().get(frame)
-        return sorted(faces, key=lambda x: x.bbox[0])
-    except:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        reuse_detection = False
+        if _last_gray_frame is not None:
+            diff = np.abs(gray.astype(np.float32) - _last_gray_frame.astype(np.float32))
+            if np.mean(diff) < 5.0:
+                _cache_reuse_count += 1
+                if _cache_reuse_count < _CACHE_REUSE_MAX:
+                    reuse_detection = True
+                else:
+                    _cache_reuse_count = 0
+            else:
+                _cache_reuse_count = 0
+        if reuse_detection:
+            return _last_faces
+        else:
+            faces = get_face_analyser().get(frame)
+            _last_gray_frame = gray
+            _last_faces = sorted(faces, key=lambda x: x.bbox[0])
+            return _last_faces
+    except Exception:
         return None
-
 
 def extract_face_images(source_filename, video_info, extra_padding=-1.0):
     face_data = []
@@ -92,7 +111,6 @@ def extract_face_images(source_filename, video_info, extra_padding=-1.0):
                 (startX, startY, endX, endY) = face["bbox"].astype("int")
                 startX, endX, startY, endY = clamp_cut_values(startX, endX, startY, endY, source_image)
                 cutout_padding = extra_padding
-                # top needs extra room for detection
                 padding = int((endY - startY) * cutout_padding)
                 oldY = startY
                 startY -= padding
@@ -128,7 +146,6 @@ def extract_face_images(source_filename, video_info, extra_padding=-1.0):
         face_data.append([face, face_temp])
     return face_data
 
-
 def clamp_cut_values(startX, endX, startY, endY, image):
     if startX < 0:
         startX = 0
@@ -140,8 +157,6 @@ def clamp_cut_values(startX, endX, startY, endY, image):
         endY = image.shape[0]
     return startX, endX, startY, endY
 
-
-
 def face_offset_top(face: Face, offset):
     face["bbox"][1] += offset
     face["bbox"][3] += offset
@@ -150,18 +165,17 @@ def face_offset_top(face: Face, offset):
     face["landmark_2d_106"] = lm106 + add
     return face
 
-
-def resize_image_keep_content(image, new_width=512, new_height=512):
+def resize_image_keep_content(image, new_width=512, new_height=512, fast_preview=False):
     dim = None
     (h, w) = image.shape[:2]
     if h > w:
         r = new_height / float(h)
         dim = (int(w * r), new_height)
     else:
-        # Calculate the ratio of the width and construct the dimensions
         r = new_width / float(w)
         dim = (new_width, int(h * r))
-    image = cv2.resize(image, dim, interpolation=cv2.INTER_AREA)
+    interpolation = cv2.INTER_NEAREST if fast_preview else cv2.INTER_LINEAR
+    image = cv2.resize(image, dim, interpolation=interpolation)
     (h, w) = image.shape[:2]
     if h == new_height and w == new_width:
         return image
@@ -169,13 +183,11 @@ def resize_image_keep_content(image, new_width=512, new_height=512):
     offs = (new_width - w) if h == new_height else (new_height - h)
     startoffs = int(offs // 2) if offs % 2 == 0 else int(offs // 2) + 1
     offs = int(offs // 2)
-
     if h == new_height:
         resize_img[0:new_height, startoffs : new_width - offs] = image
     else:
         resize_img[startoffs : new_height - offs, 0:new_width] = image
     return resize_img
-
 
 def rotate_image_90(image, rotate=True):
     if rotate:
@@ -183,21 +195,16 @@ def rotate_image_90(image, rotate=True):
     else:
         return np.rot90(image, 1, (1, 0))
 
-
 def rotate_anticlockwise(frame):
     return rotate_image_90(frame)
-
 
 def rotate_clockwise(frame):
     return rotate_image_90(frame, False)
 
-
 def rotate_image_180(image):
     return np.flip(image, 0)
 
-
-# alignment code from insightface https://github.com/deepinsight/insightface/blob/master/python-package/insightface/utils/face_align.py
-
+# alignment code from insightface
 arcface_dst = np.array(
     [
         [38.2946, 51.6963],
@@ -209,8 +216,7 @@ arcface_dst = np.array(
     dtype=np.float32,
 )
 
-
-""" def estimate_norm(lmk, image_size=112):
+def estimate_norm(lmk, image_size=112):
     assert lmk.shape == (5, 2)
     if image_size % 112 == 0:
         ratio = float(image_size) / 112.0
@@ -221,51 +227,17 @@ arcface_dst = np.array(
     elif image_size % 512 == 0:
         ratio = float(image_size) / 512.0
         diff_x = 32.0 * ratio
-
     dst = arcface_dst * ratio
     dst[:, 0] += diff_x
     tform = trans.SimilarityTransform()
     tform.estimate(lmk, dst)
     M = tform.params[0:2, :]
     return M
- """
 
-def estimate_norm(lmk, image_size=112):
-    if image_size%112==0:
-        ratio = float(image_size)/112.0
-        diff_x = 0
-    else:
-        ratio = float(image_size)/128.0
-        diff_x = 8.0*ratio
-    dst = arcface_dst * ratio
-    dst[:,0] += diff_x
-
-    if image_size == 160:
-        dst[:,0] += 0.1
-        dst[:,1] += 0.1
-    elif image_size == 256:
-        dst[:,0] += 0.5
-        dst[:,1] += 0.5
-    elif image_size == 320:
-        dst[:,0] += 0.75
-        dst[:,1] += 0.75
-    elif image_size == 512:
-        dst[:,0] += 1.5
-        dst[:,1] += 1.5
-
-    tform = trans.SimilarityTransform()
-    tform.estimate(lmk, dst)
-    M = tform.params[0:2, :]
-    return M
-
-
-
-# aligned, M = norm_crop2(f[1], face.kps, 512)
 def align_crop(img, landmark, image_size=112, mode="arcface"):
     M = estimate_norm(landmark, image_size)
     warped = cv2.warpAffine(img, M, (image_size, image_size), borderValue=0.0)
     return warped, M
-
 
 def square_crop(im, S):
     if im.shape[0] > im.shape[1]:
@@ -281,11 +253,9 @@ def square_crop(im, S):
     det_im[: resized_im.shape[0], : resized_im.shape[1], :] = resized_im
     return det_im, scale
 
-
 def transform(data, center, output_size, scale, rotation):
     scale_ratio = scale
     rot = float(rotation) * np.pi / 180.0
-    # translation = (output_size/2-center[0]*scale_ratio, output_size/2-center[1]*scale_ratio)
     t1 = trans.SimilarityTransform(scale=scale_ratio)
     cx = center[0] * scale_ratio
     cy = center[1] * scale_ratio
@@ -297,33 +267,25 @@ def transform(data, center, output_size, scale, rotation):
     cropped = cv2.warpAffine(data, M, (output_size, output_size), borderValue=0.0)
     return cropped, M
 
-
 def trans_points2d(pts, M):
     new_pts = np.zeros(shape=pts.shape, dtype=np.float32)
     for i in range(pts.shape[0]):
         pt = pts[i]
         new_pt = np.array([pt[0], pt[1], 1.0], dtype=np.float32)
         new_pt = np.dot(M, new_pt)
-        # print('new_pt', new_pt.shape, new_pt)
         new_pts[i] = new_pt[0:2]
-
     return new_pts
-
 
 def trans_points3d(pts, M):
     scale = np.sqrt(M[0][0] * M[0][0] + M[0][1] * M[0][1])
-    # print(scale)
     new_pts = np.zeros(shape=pts.shape, dtype=np.float32)
     for i in range(pts.shape[0]):
         pt = pts[i]
         new_pt = np.array([pt[0], pt[1], 1.0], dtype=np.float32)
         new_pt = np.dot(M, new_pt)
-        # print('new_pt', new_pt.shape, new_pt)
         new_pts[i][0:2] = new_pt[0:2]
         new_pts[i][2] = pts[i][2] * scale
-
     return new_pts
-
 
 def trans_points(pts, M):
     if pts.shape[1] == 2:
@@ -335,4 +297,3 @@ def create_blank_image(width, height):
     img = np.zeros((height, width, 4), dtype=np.uint8)
     img[:] = [0,0,0,0]
     return img
-
