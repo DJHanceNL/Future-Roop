@@ -10,16 +10,12 @@ import numpy as np
 from skimage import transform as trans
 from roop.capturer import get_video_frame
 from roop.utilities import resolve_relative_path, conditional_thread_semaphore
-import hashlib
-import os
 
 FACE_ANALYSER = None
 #THREAD_LOCK_ANALYSER = threading.Lock()
 #THREAD_LOCK_SWAPPER = threading.Lock()
 FACE_SWAPPER = None
 
-_last_gray_frame = None   # <-- For fuzzy caching
-_last_faces = None
 
 def get_face_analyser() -> Any:
     global FACE_ANALYSER
@@ -56,33 +52,11 @@ def get_first_face(frame: Frame) -> Any:
         return None
 
 
-def _frame_hash(frame: Frame) -> str:
-    """Generate a quick hash for a frame. Works well for caching."""
-    return hashlib.md5(frame.tobytes()).hexdigest()
-
 def get_all_faces(frame: Frame) -> Any:
-    global _last_gray_frame, _last_faces
     try:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        reuse_detection = False
-        if _last_gray_frame is not None:
-            # Only compare if shapes match
-            if gray.shape == _last_gray_frame.shape:
-                diff = np.abs(gray.astype(np.float32) - _last_gray_frame.astype(np.float32))
-                if np.mean(diff) < 5.0:
-                    reuse_detection = True
-        if reuse_detection:
-            print("Reusing detection from last frame!")
-            return _last_faces
-        else:
-            print("Running fresh face detection!")
-
         faces = get_face_analyser().get(frame)
-        _last_gray_frame = gray
-        _last_faces = sorted(faces, key=lambda x: x.bbox[0])
-        return _last_faces
-    except Exception as e:
-        print(f"Error in get_all_faces: {e}")
+        return sorted(faces, key=lambda x: x.bbox[0])
+    except:
         return None
 
 
@@ -114,7 +88,7 @@ def extract_face_images(source_filename, video_info, extra_padding=-1.0):
                 continue
 
             found = False
-            for j in range(1, 3):
+            for i in range(1, 3):
                 (startX, startY, endX, endY) = face["bbox"].astype("int")
                 startX, endX, startY, endY = clamp_cut_values(startX, endX, startY, endY, source_image)
                 cutout_padding = extra_padding
@@ -123,17 +97,18 @@ def extract_face_images(source_filename, video_info, extra_padding=-1.0):
                 oldY = startY
                 startY -= padding
 
-                factor = 0.25 if j == 1 else 0.5
+                factor = 0.25 if i == 1 else 0.5
                 cutout_padding = factor
                 padding = int((endY - oldY) * cutout_padding)
                 endY += padding
                 padding = int((endX - startX) * cutout_padding)
                 startX -= padding
                 endX += padding
-                startX, endX, startY, endY = clamp_cut_values(startX, endX, startY, endY, source_image)
+                startX, endX, startY, endY = clamp_cut_values(
+                    startX, endX, startY, endY, source_image
+                )
                 face_temp = source_image[startY:endY, startX:endX]
-                # Only resize if model requires 512x512
-                # face_temp = resize_image_keep_content(face_temp)
+                face_temp = resize_image_keep_content(face_temp)
                 testfaces = get_all_faces(face_temp)
                 if testfaces is not None and len(testfaces) > 0:
                     i += 1
@@ -148,8 +123,7 @@ def extract_face_images(source_filename, video_info, extra_padding=-1.0):
         face_temp = source_image[startY:endY, startX:endX]
         if face_temp.size < 1:
             continue
-        # Only resize if model requires 512x512
-        # face_temp = resize_image_keep_content(face_temp)
+
         i += 1
         face_data.append([face, face_temp])
     return face_data
@@ -178,23 +152,29 @@ def face_offset_top(face: Face, offset):
 
 
 def resize_image_keep_content(image, new_width=512, new_height=512):
-    h, w = image.shape[:2]
-    # Only resize if needed
+    dim = None
+    (h, w) = image.shape[:2]
+    if h > w:
+        r = new_height / float(h)
+        dim = (int(w * r), new_height)
+    else:
+        # Calculate the ratio of the width and construct the dimensions
+        r = new_width / float(w)
+        dim = (new_width, int(h * r))
+    image = cv2.resize(image, dim, interpolation=cv2.INTER_AREA)
+    (h, w) = image.shape[:2]
     if h == new_height and w == new_width:
         return image
-    # Preserve aspect ratio, only resize if larger or required by model
-    scale = min(new_width / w, new_height / h)
-    if scale < 1.0:
-        dim = (int(w * scale), int(h * scale))
-        image = cv2.resize(image, dim, interpolation=cv2.INTER_LANCZOS4)
-        h, w = image.shape[:2]
-    # Pad if needed
-    top = (new_height - h) // 2
-    bottom = new_height - h - top
-    left = (new_width - w) // 2
-    right = new_width - w - left
-    image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_REFLECT)
-    return image
+    resize_img = np.zeros(shape=(new_height, new_width, 3), dtype=image.dtype)
+    offs = (new_width - w) if h == new_height else (new_height - h)
+    startoffs = int(offs // 2) if offs % 2 == 0 else int(offs // 2) + 1
+    offs = int(offs // 2)
+
+    if h == new_height:
+        resize_img[0:new_height, startoffs : new_width - offs] = image
+    else:
+        resize_img[startoffs : new_height - offs, 0:new_width] = image
+    return resize_img
 
 
 def rotate_image_90(image, rotate=True):
@@ -230,7 +210,7 @@ arcface_dst = np.array(
 )
 
 
-def estimate_norm(lmk, image_size=112):
+""" def estimate_norm(lmk, image_size=112):
     assert lmk.shape == (5, 2)
     if image_size % 112 == 0:
         ratio = float(image_size) / 112.0
@@ -244,6 +224,35 @@ def estimate_norm(lmk, image_size=112):
 
     dst = arcface_dst * ratio
     dst[:, 0] += diff_x
+    tform = trans.SimilarityTransform()
+    tform.estimate(lmk, dst)
+    M = tform.params[0:2, :]
+    return M
+ """
+
+def estimate_norm(lmk, image_size=112):
+    if image_size%112==0:
+        ratio = float(image_size)/112.0
+        diff_x = 0
+    else:
+        ratio = float(image_size)/128.0
+        diff_x = 8.0*ratio
+    dst = arcface_dst * ratio
+    dst[:,0] += diff_x
+
+    if image_size == 160:
+        dst[:,0] += 0.1
+        dst[:,1] += 0.1
+    elif image_size == 256:
+        dst[:,0] += 0.5
+        dst[:,1] += 0.5
+    elif image_size == 320:
+        dst[:,0] += 0.75
+        dst[:,1] += 0.75
+    elif image_size == 512:
+        dst[:,0] += 1.5
+        dst[:,1] += 1.5
+
     tform = trans.SimilarityTransform()
     tform.estimate(lmk, dst)
     M = tform.params[0:2, :]
@@ -326,14 +335,4 @@ def create_blank_image(width, height):
     img = np.zeros((height, width, 4), dtype=np.uint8)
     img[:] = [0,0,0,0]
     return img
-
-def save_intermediate_image(img, name):
-    import roop.globals
-    if not getattr(roop.globals, 'DEBUG_SAVE_INTERMEDIATES', False):
-        return
-    outdir = getattr(roop.globals, 'DEBUG_INTERMEDIATE_DIR', './debug_intermediates')
-    os.makedirs(outdir, exist_ok=True)
-    path = os.path.join(outdir, name)
-    import cv2
-    cv2.imwrite(path, img)
 

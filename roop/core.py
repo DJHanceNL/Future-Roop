@@ -17,7 +17,6 @@ import pathlib
 import argparse
 
 from time import time
-from concurrent.futures import ThreadPoolExecutor
 
 import roop.globals
 import roop.metadata
@@ -94,8 +93,7 @@ def suggest_execution_threads() -> int:
         return 1
     if 'ROCMExecutionProvider' in roop.globals.execution_providers:
         return 1
-    # Use all available CPU cores
-    return os.cpu_count() or 8
+    return 8
 
 
 def limit_resources() -> None:
@@ -295,12 +293,7 @@ def batch_process(output_method, files:list[ProcessEntry], use_new_method) -> No
         for f in imagefiles:
             origimages.append(f.filename)
             fakeimages.append(f.finalname)
-        # If debug mode, force PNG output for lossless quality
-        if getattr(roop.globals, 'DEBUG_SAVE_INTERMEDIATES', False):
-            for i, f in enumerate(imagefiles):
-                if f.finalname:
-                    root, _ = os.path.splitext(f.finalname)
-                    f.finalname = root + '.png'
+
         process_mgr.run_batch(origimages, fakeimages, roop.globals.execution_threads)
         origimages.clear()
         fakeimages.clear()
