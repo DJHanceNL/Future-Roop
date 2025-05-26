@@ -17,6 +17,7 @@ import pathlib
 import argparse
 
 from time import time
+from concurrent.futures import ThreadPoolExecutor
 
 import roop.globals
 import roop.metadata
@@ -29,7 +30,6 @@ from roop.ProcessEntry import ProcessEntry
 from roop.ProcessMgr import ProcessMgr
 from roop.ProcessOptions import ProcessOptions
 from roop.capturer import get_video_frame_total, release_video
-import concurrent.futures
 
 
 clip_text = None
@@ -94,7 +94,8 @@ def suggest_execution_threads() -> int:
         return 1
     if 'ROCMExecutionProvider' in roop.globals.execution_providers:
         return 1
-    return 8
+    # Use all available CPU cores
+    return os.cpu_count() or 8
 
 
 def limit_resources() -> None:
@@ -135,6 +136,8 @@ def pre_check() -> bool:
     
     download_directory_path = util.resolve_relative_path('../models')
     util.conditional_download(download_directory_path, ['https://huggingface.co/countfloyd/deepfake/resolve/main/inswapper_128.onnx'])
+    util.conditional_download(download_directory_path, ['https://huggingface.co/countfloyd/deepfake/resolve/main/reswapper_128.onnx'])
+    util.conditional_download(download_directory_path, ['https://huggingface.co/countfloyd/deepfake/resolve/main/reswapper_256.onnx'])
     util.conditional_download(download_directory_path, ['https://huggingface.co/countfloyd/deepfake/resolve/main/GFPGANv1.4.onnx'])
     util.conditional_download(download_directory_path, ['https://github.com/csxmli2016/DMDNet/releases/download/v1/DMDNet.pth'])
     util.conditional_download(download_directory_path, ['https://huggingface.co/countfloyd/deepfake/resolve/main/GPEN-BFR-512.onnx'])
@@ -221,28 +224,17 @@ def live_swap(frame, options):
     return newframe
 
 
-def batch_process_regular(output_method, files:list[ProcessEntry], masking_engine:str, new_clip_text:str, use_new_method, imagemask, restore_original_mouth, num_swap_steps, progress, selected_index = 0) -> None:
+def batch_process_regular(swap_model, output_method, files:list[ProcessEntry], masking_engine:str, new_clip_text:str, use_new_method, imagemask, restore_original_mouth, num_swap_steps, progress, selected_index = 0) -> None:
     global clip_text, process_mgr
 
     release_resources()
     limit_resources()
     if process_mgr is None:
         process_mgr = ProcessMgr(progress)
-    print("DEBUG (core.py) imagemask:", imagemask)
-    if (
-        imagemask is None or
-        "layers" not in imagemask or
-        not isinstance(imagemask["layers"], list) or
-        len(imagemask["layers"]) == 0
-    ):
-        print("WARNING: No layers found in imagemask in core.py - skipping mask assignment")
-        mask = None
-    else:
-        mask = imagemask["layers"][0]
-
+    mask = imagemask["layers"][0] if imagemask is not None else None
     if len(roop.globals.INPUT_FACESETS) <= selected_index:
         selected_index = 0
-    options = ProcessOptions(get_processing_plugins(masking_engine), roop.globals.distance_threshold, roop.globals.blend_ratio,
+    options = ProcessOptions(swap_model, get_processing_plugins(masking_engine), roop.globals.distance_threshold, roop.globals.blend_ratio,
                               roop.globals.face_swap_mode, selected_index, new_clip_text, mask, num_swap_steps,
                               roop.globals.subsample_size, False, restore_original_mouth)
     process_mgr.initialize(roop.globals.INPUT_FACESETS, roop.globals.TARGET_FACES, options)
@@ -279,6 +271,7 @@ def batch_process(output_method, files:list[ProcessEntry], use_new_method) -> No
            
     update_status('Sorting videos/images')
 
+
     for index, f in enumerate(files):
         fullname = f.filename
         if util.has_image_extension(fullname):
@@ -293,6 +286,8 @@ def batch_process(output_method, files:list[ProcessEntry], use_new_method) -> No
             f.finalname = destination
             videofiles.append(f)
 
+
+
     if(len(imagefiles) > 0):
         update_status('Processing image(s)')
         origimages = []
@@ -300,13 +295,18 @@ def batch_process(output_method, files:list[ProcessEntry], use_new_method) -> No
         for f in imagefiles:
             origimages.append(f.filename)
             fakeimages.append(f.finalname)
-
+        # If debug mode, force PNG output for lossless quality
+        if getattr(roop.globals, 'DEBUG_SAVE_INTERMEDIATES', False):
+            for i, f in enumerate(imagefiles):
+                if f.finalname:
+                    root, _ = os.path.splitext(f.finalname)
+                    f.finalname = root + '.png'
         process_mgr.run_batch(origimages, fakeimages, roop.globals.execution_threads)
         origimages.clear()
         fakeimages.clear()
 
     if(len(videofiles) > 0):
-        for index, v in enumerate(videofiles):
+        for index,v in enumerate(videofiles):
             if not roop.globals.processing:
                 end_processing('Processing stopped!')
                 return
@@ -322,21 +322,13 @@ def batch_process(output_method, files:list[ProcessEntry], use_new_method) -> No
             if is_streaming_only == False and roop.globals.keep_frames or not use_new_method:
                 util.create_temp(v.filename)
                 update_status('Extracting frames...')
-                ffmpeg.extract_frames(v.filename, v.startframe, v.endframe, fps)
+                ffmpeg.extract_frames(v.filename,v.startframe,v.endframe, fps)
                 if not roop.globals.processing:
                     end_processing('Processing stopped!')
                     return
 
                 temp_frame_paths = util.get_temp_frame_paths(v.filename)
-                # --- BEGIN PARALLEL PROCESSING CHANGE HERE ---
-                frame_pairs = list(zip(temp_frame_paths, temp_frame_paths))
-                def process_pair(pair):
-                    # Assumes process_mgr has a per-frame process method, otherwise adjust accordingly
-                    return process_mgr.process_frame(pair[0])
-                with concurrent.futures.ThreadPoolExecutor(max_workers=roop.globals.execution_threads) as executor:
-                    list(executor.map(process_pair, frame_pairs))
-                # --- END PARALLEL PROCESSING ---
-
+                process_mgr.run_batch(temp_frame_paths, temp_frame_paths, roop.globals.execution_threads)
                 if not roop.globals.processing:
                     end_processing('Processing stopped!')
                     return
@@ -355,7 +347,7 @@ def batch_process(output_method, files:list[ProcessEntry], use_new_method) -> No
                     skip_audio = True
                 else:
                     skip_audio = roop.globals.skip_audio
-                process_mgr.run_batch_inmem(output_method, v.filename, v.finalname, v.startframe, v.endframe, fps, roop.globals.execution_threads)
+                process_mgr.run_batch_inmem(output_method, v.filename, v.finalname, v.startframe, v.endframe, fps,roop.globals.execution_threads)
                 
             if not roop.globals.processing:
                 end_processing('Processing stopped!')

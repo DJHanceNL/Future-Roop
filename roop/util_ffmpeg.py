@@ -1,4 +1,3 @@
-
 import os
 import subprocess
 import roop.globals
@@ -9,13 +8,21 @@ from typing import List, Any
 def run_ffmpeg(args: List[str]) -> bool:
     commands = ['ffmpeg', '-hide_banner', '-hwaccel', 'auto', '-y', '-loglevel', roop.globals.log_level]
     commands.extend(args)
-    print ("Running ffmpeg")
+    print("Running ffmpeg:", ' '.join(commands))
     try:
-        subprocess.check_output(commands, stderr=subprocess.STDOUT)
+        result = subprocess.run(commands, capture_output=True, text=True)
+        print("ffmpeg stdout:")
+        print(result.stdout)
+        print("ffmpeg stderr:")
+        print(result.stderr)
+        if result.returncode != 0:
+            print("ffmpeg failed with return code:", result.returncode)
+            return False
         return True
     except Exception as e:
         print("Running ffmpeg failed! Commandline:")
-        print (" ".join(commands))
+        print(" ".join(commands))
+        print("Exception:", e)
     return False
 
 
@@ -62,7 +69,9 @@ def extract_frames(target_path : str, trim_frame_start, trim_frame_end, fps : fl
     if trim_frame_start is not None and trim_frame_end is not None:
         commands.extend([ '-vf', 'trim=start_frame=' + str(trim_frame_start) + ':end_frame=' + str(trim_frame_end) + ',fps=' + str(fps) ])
     commands.extend(['-vsync', '0', os.path.join(temp_directory_path, '%06d.' + roop.globals.CFG.output_image_format)])
-    return run_ffmpeg(commands)
+    result = run_ffmpeg(commands)
+    print("extract_frames finished, result:", result)
+    return result
 
 
 def create_video(target_path: str, dest_filename: str, fps: float = 24.0, temp_directory_path: str = None) -> None:

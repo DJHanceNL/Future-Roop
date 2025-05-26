@@ -6,7 +6,7 @@ import psutil
 from roop.ProcessOptions import ProcessOptions
 
 from roop.face_util import get_first_face, get_all_faces, rotate_anticlockwise, rotate_clockwise, clamp_cut_values
-from roop.utilities import compute_cosine_distance, get_device, str_to_class
+from roop.utilities import compute_cosine_distance, get_device, str_to_class, shuffle_array
 import roop.vr_util as vr
 
 from typing import Any, List, Callable
@@ -18,7 +18,15 @@ from tqdm import tqdm
 from roop.ffmpeg_writer import FFMPEG_VideoWriter
 from roop.StreamWriter import StreamWriter
 import roop.globals
-import gc
+import os
+
+def save_intermediate_image(img, name):
+    if not getattr(roop.globals, 'DEBUG_SAVE_INTERMEDIATES', False):
+        return
+    outdir = getattr(roop.globals, 'DEBUG_INTERMEDIATE_DIR', './debug_intermediates')
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, name)
+    cv2.imwrite(path, img)
 
 
 
@@ -118,6 +126,11 @@ class ProcessMgr():
         roop.globals.g_desired_face_analysis=["landmark_3d_68", "landmark_2d_106","detection","recognition"]
         if options.swap_mode == "all_female" or options.swap_mode == "all_male":
             roop.globals.g_desired_face_analysis.append("genderage")
+        elif options.swap_mode == "all_random":
+            # don't modify original list
+            self.input_face_datas = input_faces.copy()
+            shuffle_array(self.input_face_datas)
+
 
         for p in self.processors:
             newp = next((x for x in options.processors.keys() if x == p.processorname), None)
@@ -134,6 +147,14 @@ class ProcessMgr():
                 p = str_to_class(module, classname)
             if p is not None:
                 extoption.update({"devicename": devicename})
+                if p.type == "swap":
+                    if self.options.swap_modelname == "InSwapper 128":
+                        extoption.update({"modelname": "inswapper_128.onnx"})
+                    elif self.options.swap_modelname == "ReSwapper 128":
+                        extoption.update({"modelname": "reswapper_128.onnx"})
+                    elif self.options.swap_modelname == "ReSwapper 256":
+                        extoption.update({"modelname": "reswapper_256.onnx"})
+
                 p.Initialize(extoption)
                 newprocessors.append(p)
             else:
@@ -181,7 +202,7 @@ class ProcessMgr():
 
 
     def process_frames(self, source_files: List[str], target_files: List[str], current_files, update: Callable[[], None]) -> None:
-        for idx, f in enumerate(current_files):
+        for f in current_files:
             if not roop.globals.processing:
                 return
             
@@ -197,14 +218,9 @@ class ProcessMgr():
                 if resimg is not None:
                     i = source_files.index(f)
                     # Also let numpy write the file to support utf-8/16 filenames
-                    cv2.imencode(f'.{roop.globals.CFG.output_image_format}', resimg)[1].tofile(target_files[i])
-            
+                    cv2.imencode(f'.{roop.globals.CFG.output_image_format}',resimg)[1].tofile(target_files[i])
             if update:
                 update()
-            
-            # Aggressively collect garbage every 10 frames
-            if idx % 10 == 0:
-                gc.collect()
 
 
 
@@ -230,7 +246,6 @@ class ProcessMgr():
 
 
     def process_videoframes(self, threadindex, progress) -> None:
-        frame_counter = 0
         while True:
             frame = self.frames_queue[threadindex].get()
             if frame is None:
@@ -247,10 +262,6 @@ class ProcessMgr():
                 self.processed_queue[threadindex].put((True, resimg))
                 del frame
                 progress()
-            
-            frame_counter += 1
-            if frame_counter % 10 == 0:
-                gc.collect()
 
 
     def write_frames_thread(self):
@@ -428,7 +439,7 @@ class ProcessMgr():
                     num_faces_found += 1
                     temp_frame = self.process_face(self.options.selected_index, face, temp_frame)
 
-            elif self.options.swap_mode == "all_input":
+            elif self.options.swap_mode == "all_input" or self.options.swap_mode == "all_random":
                 for i,face in enumerate(faces):
                     num_faces_found += 1
                     if i < len(self.input_face_datas):
@@ -543,7 +554,7 @@ class ProcessMgr():
 
 
     def process_face(self,face_index, target_face:Face, frame:Frame):
-        from roop.face_util import align_crop
+        from roop.face_util import align_crop, save_intermediate_image
 
         enhanced_frame = None
         if(len(self.input_face_datas) > 0):
@@ -576,49 +587,31 @@ class ProcessMgr():
 
 
 
-        # if roop.globals.vr_mode:
-            # bbox = target_face.bbox
-            # [orig_width, orig_height, _] = frame.shape
-
-            # # Convert bounding box to ints
-            # x1, y1, x2, y2 = map(int, bbox)
-
-            # # Determine the center of the bounding box
-            # x_center = (x1 + x2) / 2
-            # y_center = (y1 + y2) / 2
-
-            # # Normalize coordinates to range [-1, 1]
-            # x_center_normalized = x_center / (orig_width / 2) - 1
-            # y_center_normalized = y_center / (orig_width / 2) - 1
-
-            # # Convert normalized coordinates to spherical (theta, phi)
-            # theta = x_center_normalized * 180  # Theta ranges from -180 to 180 degrees
-            # phi = -y_center_normalized * 90  # Phi ranges from -90 to 90 degrees
-
-            # img = vr.GetPerspective(frame, 90, theta, phi, 1280, 1280)  # Generate perspective image
-
-
-        """ Code ported/adapted from Facefusion which borrowed the idea from Rope:
-            Kind of subsampling the cutout and aligned face image and faceswapping slices of it up to
-            the desired output resolution. This works around the current resolution limitations without using enhancers.
-        """
-        model_output_size = 128
-        subsample_size = self.options.subsample_size
+        # Ensure only a single resize to swapper input size
+        model_output_size = self.options.swap_output_size
+        subsample_size = max(self.options.subsample_size, model_output_size)
         subsample_total = subsample_size // model_output_size
         aligned_img, M = align_crop(frame, target_face.kps, subsample_size)
-
+        if aligned_img.shape[0] != model_output_size or aligned_img.shape[1] != model_output_size:
+            aligned_img = cv2.resize(aligned_img, (model_output_size, model_output_size), interpolation=cv2.INTER_LANCZOS4)
+        save_intermediate_image(aligned_img, f"aligned_face_{face_index}.png")
         fake_frame = aligned_img
         target_face.matrix = M
-
         for p in self.processors:
             if p.type == 'swap':
                 swap_result_frames = []
                 subsample_frames = self.implode_pixel_boost(aligned_img, model_output_size, subsample_total)
-                for sliced_frame in subsample_frames:
+                for idx, sliced_frame in enumerate(subsample_frames):
                     for _ in range(0,self.options.num_swap_steps):
+                        save_intermediate_image(sliced_frame, f"swapper_input_{face_index}_{idx}.png")
                         sliced_frame = self.prepare_crop_frame(sliced_frame)
+                        # Save normalized input if needed
+                        # ...existing code...
                         sliced_frame = p.Run(inputface, target_face, sliced_frame)
-                        sliced_frame = self.normalize_swap_frame(sliced_frame)
+                        # Save swapper output before denormalization
+                        out_img = self.normalize_swap_frame(sliced_frame)
+                        save_intermediate_image(out_img, f"swapper_output_{face_index}_{idx}.png")
+                        sliced_frame = out_img
                     swap_result_frames.append(sliced_frame)
                 fake_frame = self.explode_pixel_boost(swap_result_frames, model_output_size, subsample_total, subsample_size)
                 fake_frame = fake_frame.astype(np.uint8)
@@ -650,6 +643,8 @@ class ProcessMgr():
             fake_frame = self.auto_unrotate_frame(result, rotation_action)
             result = self.paste_simple(fake_frame, saved_frame, startX, startY)
         
+        # Save final assembled face before returning
+        save_intermediate_image(fake_frame, f"final_face_{face_index}.png")
         return result
 
         
@@ -906,4 +901,3 @@ class ProcessMgr():
             self.videowriter.close()
         if self.streamwriter is not None:
             self.streamwriter.Close()
-
