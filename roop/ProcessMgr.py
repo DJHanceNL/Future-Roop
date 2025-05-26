@@ -18,6 +18,15 @@ from tqdm import tqdm
 from roop.ffmpeg_writer import FFMPEG_VideoWriter
 from roop.StreamWriter import StreamWriter
 import roop.globals
+import os
+
+def save_intermediate_image(img, name):
+    if not getattr(roop.globals, 'DEBUG_SAVE_INTERMEDIATES', False):
+        return
+    outdir = getattr(roop.globals, 'DEBUG_INTERMEDIATE_DIR', './debug_intermediates')
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, name)
+    cv2.imwrite(path, img)
 
 
 
@@ -545,7 +554,7 @@ class ProcessMgr():
 
 
     def process_face(self,face_index, target_face:Face, frame:Frame):
-        from roop.face_util import align_crop
+        from roop.face_util import align_crop, save_intermediate_image
 
         enhanced_frame = None
         if(len(self.input_face_datas) > 0):
@@ -578,49 +587,31 @@ class ProcessMgr():
 
 
 
-        # if roop.globals.vr_mode:
-            # bbox = target_face.bbox
-            # [orig_width, orig_height, _] = frame.shape
-
-            # # Convert bounding box to ints
-            # x1, y1, x2, y2 = map(int, bbox)
-
-            # # Determine the center of the bounding box
-            # x_center = (x1 + x2) / 2
-            # y_center = (y1 + y2) / 2
-
-            # # Normalize coordinates to range [-1, 1]
-            # x_center_normalized = x_center / (orig_width / 2) - 1
-            # y_center_normalized = y_center / (orig_width / 2) - 1
-
-            # # Convert normalized coordinates to spherical (theta, phi)
-            # theta = x_center_normalized * 180  # Theta ranges from -180 to 180 degrees
-            # phi = -y_center_normalized * 90  # Phi ranges from -90 to 90 degrees
-
-            # img = vr.GetPerspective(frame, 90, theta, phi, 1280, 1280)  # Generate perspective image
-
-
-        """ Code ported/adapted from Facefusion which borrowed the idea from Rope:
-            Kind of subsampling the cutout and aligned face image and faceswapping slices of it up to
-            the desired output resolution. This works around the current resolution limitations without using enhancers.
-        """
+        # Ensure only a single resize to swapper input size
         model_output_size = self.options.swap_output_size
         subsample_size = max(self.options.subsample_size, model_output_size)
         subsample_total = subsample_size // model_output_size
         aligned_img, M = align_crop(frame, target_face.kps, subsample_size)
-
+        if aligned_img.shape[0] != model_output_size or aligned_img.shape[1] != model_output_size:
+            aligned_img = cv2.resize(aligned_img, (model_output_size, model_output_size), interpolation=cv2.INTER_LANCZOS4)
+        save_intermediate_image(aligned_img, f"aligned_face_{face_index}.png")
         fake_frame = aligned_img
         target_face.matrix = M
-
         for p in self.processors:
             if p.type == 'swap':
                 swap_result_frames = []
                 subsample_frames = self.implode_pixel_boost(aligned_img, model_output_size, subsample_total)
-                for sliced_frame in subsample_frames:
+                for idx, sliced_frame in enumerate(subsample_frames):
                     for _ in range(0,self.options.num_swap_steps):
+                        save_intermediate_image(sliced_frame, f"swapper_input_{face_index}_{idx}.png")
                         sliced_frame = self.prepare_crop_frame(sliced_frame)
+                        # Save normalized input if needed
+                        # ...existing code...
                         sliced_frame = p.Run(inputface, target_face, sliced_frame)
-                        sliced_frame = self.normalize_swap_frame(sliced_frame)
+                        # Save swapper output before denormalization
+                        out_img = self.normalize_swap_frame(sliced_frame)
+                        save_intermediate_image(out_img, f"swapper_output_{face_index}_{idx}.png")
+                        sliced_frame = out_img
                     swap_result_frames.append(sliced_frame)
                 fake_frame = self.explode_pixel_boost(swap_result_frames, model_output_size, subsample_total, subsample_size)
                 fake_frame = fake_frame.astype(np.uint8)
@@ -652,6 +643,8 @@ class ProcessMgr():
             fake_frame = self.auto_unrotate_frame(result, rotation_action)
             result = self.paste_simple(fake_frame, saved_frame, startX, startY)
         
+        # Save final assembled face before returning
+        save_intermediate_image(fake_frame, f"final_face_{face_index}.png")
         return result
 
         
@@ -908,4 +901,3 @@ class ProcessMgr():
             self.videowriter.close()
         if self.streamwriter is not None:
             self.streamwriter.Close()
-

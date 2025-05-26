@@ -1,5 +1,6 @@
 from settings import Settings
 from typing import List
+import os
 
 source_path = None
 target_path = None
@@ -52,5 +53,9 @@ VIDEO_CHAIN_PROCESSOR = None
 BATCH_IMAGE_CHAIN_PROCESSOR = None
 
 CFG: Settings = None
+
+# Debug mode for saving intermediate images
+DEBUG_SAVE_INTERMEDIATES = bool(os.environ.get('ROOP_DEBUG_SAVE_INTERMEDIATES', '0') == '1')
+DEBUG_INTERMEDIATE_DIR = os.environ.get('ROOP_DEBUG_INTERMEDIATE_DIR', './debug_intermediates')
 
 
