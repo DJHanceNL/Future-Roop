@@ -4,8 +4,28 @@ class ProcessOptions:
         if swap_model is not None: 
             self.swap_modelname = swap_model
             self.swap_output_size = int(swap_model.split()[-1])
+            # Model metadata for hyperswap support
+            if swap_model == "Hyperswap 256":
+                self.model_type = 'hyperswap'
+                self.model_mean = [0.5, 0.5, 0.5]
+                self.model_std = [0.5, 0.5, 0.5]
+                self.model_precision = 'fp16'
+            elif swap_model == "inswapper 128 fp16":
+                self.model_type = 'inswapper'
+                self.model_mean = [0.0, 0.0, 0.0]
+                self.model_std = [1.0, 1.0, 1.0]
+                self.model_precision = 'fp16'
+            else:
+                self.model_type = 'inswapper'
+                self.model_mean = [0.0, 0.0, 0.0]
+                self.model_std = [1.0, 1.0, 1.0]
+                self.model_precision = 'fp32'
         else:
             self.swap_output_size = 128
+            self.model_type = 'inswapper'
+            self.model_mean = [0.0, 0.0, 0.0]
+            self.model_std = [1.0, 1.0, 1.0]
+            self.model_precision = 'fp32'
         self.processors = processordefines
         self.face_distance_threshold = face_distance
         self.blend_ratio = blend_ratio

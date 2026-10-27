@@ -31,7 +31,7 @@ selected_preview_index = 0
 is_processing = False            
 
 list_files_process : list[ProcessEntry] = []
-model_swap_choices = ["InSwapper 128", "ReSwapper 128", "ReSwapper 256"]
+model_swap_choices = ["InSwapper 128", "ReSwapper 128", "ReSwapper 256" , "inswapper_128_fp16" , "Hyperswap 256"]
 
 no_face_choices = ["Use untouched original frame","Retry rotated", "Skip Frame", "Skip Frame if no similar face", "Use last swapped"]
 swap_choices = ["First found", "All input faces", "All input faces (random)", "All female", "All male", "All faces", "Selected face"]

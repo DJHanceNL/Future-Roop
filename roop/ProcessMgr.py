@@ -141,10 +141,12 @@ class ProcessMgr():
                 if p.type == "swap":
                     if self.options.swap_modelname == "InSwapper 128":
                         extoption.update({"modelname": "inswapper_128.onnx"})
-                    elif self.options.swap_modelname == "ReSwapper 128":
-                        extoption.update({"modelname": "reswapper_128.onnx"})
+                    elif self.options.swap_modelname == "inswapper 128 fp16":
+                        extoption.update({"modelname": "inswapper_128_fp16.onnx"})
                     elif self.options.swap_modelname == "ReSwapper 256":
                         extoption.update({"modelname": "reswapper_256.onnx"})
+                    elif self.options.swap_modelname == "Hyperswap 256":
+                        extoption.update({"modelname": "hyperswap_1a_256.onnx"})
 
                 p.Initialize(extoption)
                 newprocessors.append(p)
@@ -751,9 +753,9 @@ class ProcessMgr():
 
 
     def prepare_crop_frame(self, swap_frame):
-        model_type = 'inswapper'
-        model_mean = [0.0, 0.0, 0.0]
-        model_standard_deviation = [1.0, 1.0, 1.0]
+        model_type = self.options.model_type
+        model_mean = self.options.model_mean
+        model_standard_deviation = self.options.model_std
 
         if model_type == 'ghost':
             swap_frame = swap_frame[:, :, ::-1] / 127.5 - 1
@@ -766,11 +768,17 @@ class ProcessMgr():
 
 
     def normalize_swap_frame(self, swap_frame):
-        model_type = 'inswapper'
+        model_type = self.options.model_type
+        model_mean = self.options.model_mean
+        model_standard_deviation = self.options.model_std
         swap_frame = swap_frame.transpose(1, 2, 0)
 
         if model_type == 'ghost':
             swap_frame = (swap_frame * 127.5 + 127.5).round()
+        elif model_type == 'hyperswap':
+            # Reverse normalization: x = x * std + mean, then scale to 0-255
+            swap_frame = swap_frame * model_standard_deviation + model_mean
+            swap_frame = (swap_frame * 255.0).round()
         else:
             swap_frame = (swap_frame * 255.0).round()
         swap_frame = swap_frame[:, :, ::-1]
